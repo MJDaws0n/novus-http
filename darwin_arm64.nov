@@ -1,0 +1,447 @@
+// ---------------------------------------------------------------------------
+// http/darwin_arm64 - HTTP server for macOS Apple Silicon
+// Built on top of the net library. Provides HTTP request parsing,
+// response building, and content-type detection.
+// ---------------------------------------------------------------------------
+
+module http_darwin_arm64;
+
+import ../../lib/std;
+import ../../lib/net;
+import ../../lib/file_io;
+import ../../lib/time;
+
+// ---------------------------------------------------------------------------
+// Start an HTTP server on the given port. Returns server fd or -1.
+// ---------------------------------------------------------------------------
+
+fn http_listen(port: i32) -> i32 {
+    net_ignore_sigpipe();
+    let fd: i32 = net_listen_on(port, 128);
+    return fd;
+}
+
+// ---------------------------------------------------------------------------
+// Accept a client connection. Returns client fd or -1.
+// ---------------------------------------------------------------------------
+
+fn http_accept(server_fd: i32) -> i32 {
+    return net_accept(server_fd);
+}
+
+// ---------------------------------------------------------------------------
+// Read just the HTTP headers (stops before body). Used when body needs
+// special handling (e.g. streaming large uploads to file).
+// ---------------------------------------------------------------------------
+
+fn http_read_headers_only(client_fd: i32) -> str {
+    let headers: str = "";
+    let done: bool = false;
+    let line_count: i32 = 0;
+    while (!done && line_count < 200) {
+        let line: str = net_read_line(client_fd, 8192);
+        if (len(line) == 0) {
+            done = true;
+        } else {
+            headers = headers + line + "\n";
+        }
+        line_count = line_count + 1;
+    }
+    return headers;
+}
+
+// ---------------------------------------------------------------------------
+// Read body as a string (for small bodies only, max 256KB).
+// Call AFTER http_read_headers_only to read the remaining body bytes.
+// ---------------------------------------------------------------------------
+
+fn http_read_body_small(client_fd: i32, content_length: i32) -> str {
+    let body: str = "";
+    if (content_length <= 0) { return ""; }
+    let max_body: i32 = content_length;
+    if (max_body > 262144) { max_body = 262144; }
+    let buf: str = make_buffer(8192);
+    let total: i32 = 0;
+    while (total < max_body) {
+        let remaining: i32 = max_body - total;
+        if (remaining > 8192) { remaining = 8192; }
+        let poll_result: i32 = net_poll_read(client_fd, 5000);
+        if (poll_result <= 0) { break; }
+        mov(x0, client_fd);
+        mov(x1, buf);
+        mov(x2, remaining);
+        mov(x16, 0x2000003);
+        syscall();
+        let nr: i32 = u64_to_i32(getreg(x0));
+        if (nr <= 0) { break; }
+        let k: i32 = 0;
+        while (k < nr) {
+            body = body + buf[k];
+            k = k + 1;
+        }
+        total = total + nr;
+    }
+    return body;
+}
+
+// ---------------------------------------------------------------------------
+// Read the full HTTP request (headers + body) from a client fd.
+// Returns the raw request string.
+// ---------------------------------------------------------------------------
+
+fn http_read_request(client_fd: i32) -> str {
+    let headers: str = "";
+    let content_length: i32 = 0;
+
+    // Read headers line by line
+    let done: bool = false;
+    let line_count: i32 = 0;
+    while (!done && line_count < 200) {
+        let line: str = net_read_line(client_fd, 8192);
+        if (len(line) == 0) {
+            done = true;
+        } else {
+            headers = headers + line + "\n";
+            // Check for Content-Length header
+            if (starts_with(line, "Content-Length: ") || starts_with(line, "content-length: ")) {
+                let val_str: str = substr(line, 16);
+                content_length = str_to_i32(val_str);
+            }
+        }
+        line_count = line_count + 1;
+    }
+
+    // Read body if Content-Length > 0
+    let body: str = "";
+    if (content_length > 0) {
+        let max_body: i32 = content_length;
+        if (max_body > 262144) {
+            max_body = 262144;
+        }
+        let buf: str = make_buffer(8192);
+        let total: i32 = 0;
+        while (total < max_body) {
+            let remaining: i32 = max_body - total;
+            if (remaining > 8192) { remaining = 8192; }
+            let poll_result: i32 = net_poll_read(client_fd, 5000);
+            if (poll_result <= 0) { break; }
+            mov(x0, client_fd);
+            mov(x1, buf);
+            mov(x2, remaining);
+            mov(x16, 0x2000003);
+            syscall();
+            let nr: i32 = u64_to_i32(getreg(x0));
+            if (nr <= 0) { break; }
+            let k: i32 = 0;
+            while (k < nr) {
+                body = body + buf[k];
+                k = k + 1;
+            }
+            total = total + nr;
+        }
+    }
+
+    return headers + "\n" + body;
+}
+
+// ---------------------------------------------------------------------------
+// Parse the HTTP method from a raw request (GET, POST, etc.)
+// ---------------------------------------------------------------------------
+
+fn http_get_method(request: str) -> str {
+    let space: i32 = str_find(request, " ");
+    if (space < 0) { return ""; }
+    return substr_len(request, 0, space);
+}
+
+// ---------------------------------------------------------------------------
+// Parse the request path from a raw request
+// ---------------------------------------------------------------------------
+
+fn http_get_path(request: str) -> str {
+    let first_space: i32 = str_find(request, " ");
+    if (first_space < 0) { return "/"; }
+    let rest: str = substr(request, first_space + 1);
+    let second_space: i32 = str_find(rest, " ");
+    if (second_space < 0) { return rest; }
+    return substr_len(rest, 0, second_space);
+}
+
+// ---------------------------------------------------------------------------
+// Get a specific header value from a raw request
+// ---------------------------------------------------------------------------
+
+fn http_get_header(request: str, name: str) -> str {
+    let search: str = name + ": ";
+    let pos: i32 = str_find(request, search);
+    if (pos < 0) {
+        // Try lowercase
+        let lower_name: str = str_lower(name);
+        let lower_search: str = lower_name + ": ";
+        pos = str_find(request, lower_search);
+        if (pos < 0) { return ""; }
+    }
+    let val_start: i32 = pos + len(name) + 2;
+    let rest: str = substr(request, val_start);
+    let nl: i32 = str_find(rest, "\n");
+    if (nl < 0) { return rest; }
+    return substr_len(rest, 0, nl);
+}
+
+// ---------------------------------------------------------------------------
+// Get the body from a raw request (everything after the blank line)
+// ---------------------------------------------------------------------------
+
+fn http_get_body(request: str) -> str {
+    let sep: i32 = str_find(request, "\n\n");
+    if (sep < 0) { return ""; }
+    return substr(request, sep + 2);
+}
+
+// ---------------------------------------------------------------------------
+// Send an HTTP response
+// ---------------------------------------------------------------------------
+
+fn http_status_line(code: i32) -> str {
+    if (code == 200) { return "HTTP/1.1 200 OK\r\n"; }
+    if (code == 204) { return "HTTP/1.1 204 No Content\r\n"; }
+    if (code == 404) { return "HTTP/1.1 404 Not Found\r\n"; }
+    if (code == 405) { return "HTTP/1.1 405 Method Not Allowed\r\n"; }
+    if (code == 500) { return "HTTP/1.1 500 Internal Server Error\r\n"; }
+    return "HTTP/1.1 200 OK\r\n";
+}
+
+fn http_send(client_fd: i32, status_code: i32, status_text: str, content_type: str, body: str) -> void {
+    let body_len: i32 = len(body);
+    let bl_copy: str = "" + int_to_str(body_len);
+    let ct_copy: str = "" + content_type;
+    let status: str = "" + http_status_line(status_code);
+    net_write_str(client_fd, status);
+    net_write_str(client_fd, "Content-Type: ");
+    net_write_str(client_fd, ct_copy);
+    net_write_str(client_fd, "\r\nContent-Length: ");
+    net_write_str(client_fd, bl_copy);
+    net_write_str(client_fd, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Filename, X-Chunk, X-Total\r\n\r\n");
+    if (body_len > 0) {
+        net_write_str(client_fd, body);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Convenience response methods
+// ---------------------------------------------------------------------------
+
+fn http_send_html(client_fd: i32, html: str) -> void {
+    http_send(client_fd, 200, "OK", "text/html; charset=utf-8", html);
+}
+
+fn http_send_json(client_fd: i32, json: str) -> void {
+    http_send(client_fd, 200, "OK", "application/json", json);
+}
+
+fn http_send_text(client_fd: i32, text: str) -> void {
+    http_send(client_fd, 200, "OK", "text/plain; charset=utf-8", text);
+}
+
+fn http_send_404(client_fd: i32) -> void {
+    http_send(client_fd, 404, "Not Found", "text/plain", "404 Not Found");
+}
+
+fn http_send_405(client_fd: i32) -> void {
+    http_send(client_fd, 405, "Method Not Allowed", "text/plain", "405 Method Not Allowed");
+}
+
+fn http_send_500(client_fd: i32, msg: str) -> void {
+    http_send(client_fd, 500, "Internal Server Error", "text/plain", msg);
+}
+
+fn http_send_options(client_fd: i32) -> void {
+    http_send(client_fd, 204, "No Content", "text/plain", "");
+}
+
+// ---------------------------------------------------------------------------
+// Content-type detection from file extension
+// ---------------------------------------------------------------------------
+
+fn http_content_type(path: str) -> str {
+    if (ends_with(path, ".html") || ends_with(path, ".htm")) { return "text/html; charset=utf-8"; }
+    if (ends_with(path, ".css")) { return "text/css; charset=utf-8"; }
+    if (ends_with(path, ".js")) { return "application/javascript; charset=utf-8"; }
+    if (ends_with(path, ".json")) { return "application/json"; }
+    if (ends_with(path, ".png")) { return "image/png"; }
+    if (ends_with(path, ".jpg") || ends_with(path, ".jpeg")) { return "image/jpeg"; }
+    if (ends_with(path, ".gif")) { return "image/gif"; }
+    if (ends_with(path, ".svg")) { return "image/svg+xml"; }
+    if (ends_with(path, ".ico")) { return "image/x-icon"; }
+    if (ends_with(path, ".txt")) { return "text/plain; charset=utf-8"; }
+    if (ends_with(path, ".xml")) { return "application/xml"; }
+    if (ends_with(path, ".pdf")) { return "application/pdf"; }
+    return "application/octet-stream";
+}
+
+// ---------------------------------------------------------------------------
+// Serve a static file from disk
+// ---------------------------------------------------------------------------
+
+fn http_serve_file(client_fd: i32, file_path: str) -> void {
+    if (!file_exists(file_path)) {
+        http_send_404(client_fd);
+        return;
+    }
+    let content: str = read_file(file_path);
+    let ctype: str = http_content_type(file_path);
+    http_send(client_fd, 200, "OK", ctype, content);
+}
+
+// ---------------------------------------------------------------------------
+// URL decode (basic: handles %XX and +)
+// ---------------------------------------------------------------------------
+
+fn hex_digit_val(ch: i32) -> i32 {
+    let c: i32 = ch & 255;
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return 0;
+}
+
+fn http_url_decode(s: str) -> str {
+    let result: str = "";
+    let i: i32 = 0;
+    let slen: i32 = len(s);
+    while (i < slen) {
+        if (s[i] == '+') {
+            result = result + " ";
+            i = i + 1;
+        } else if (s[i] == '%' && i + 2 < slen) {
+            let hi: i32 = hex_digit_val(s[i + 1] & 255);
+            let lo: i32 = hex_digit_val(s[i + 2] & 255);
+            let val: i32 = hi * 16 + lo;
+            let tmp: str = " ";
+            tmp[0] = val;
+            result = result + tmp;
+            i = i + 3;
+        } else {
+            result = result + s[i];
+            i = i + 1;
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Extract query string from path
+// ---------------------------------------------------------------------------
+
+fn http_get_query_string(path: str) -> str {
+    let qpos: i32 = str_find(path, "?");
+    if (qpos < 0) { return ""; }
+    return substr(path, qpos + 1);
+}
+
+fn http_get_path_only(path: str) -> str {
+    let qpos: i32 = str_find(path, "?");
+    if (qpos < 0) { return path; }
+    return substr_len(path, 0, qpos);
+}
+
+// ---------------------------------------------------------------------------
+// Simple JSON helpers for building responses
+// ---------------------------------------------------------------------------
+
+fn json_escape(s: str) -> str {
+    let result: str = "";
+    let i: i32 = 0;
+    let slen: i32 = len(s);
+    while (i < slen) {
+        let c: i32 = s[i] & 255;
+        if (s[i] == '\\') {
+            result = result + "\\\\";
+        } else if (s[i] == '"') {
+            result = result + "\\\"";
+        } else if (c == 10) {
+            result = result + "\\n";
+        } else if (c == 13) {
+            result = result + "\\r";
+        } else if (c == 9) {
+            result = result + "\\t";
+        } else {
+            result = result + s[i];
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn json_string(key: str, value: str) -> str {
+    return "\"" + json_escape(key) + "\":\"" + json_escape(value) + "\"";
+}
+
+fn json_object_1(k1: str, v1: str) -> str {
+    return "{" + json_string(k1, v1) + "}";
+}
+
+fn json_object_2(k1: str, v1: str, k2: str, v2: str) -> str {
+    return "{" + json_string(k1, v1) + "," + json_string(k2, v2) + "}";
+}
+
+fn json_object_3(k1: str, v1: str, k2: str, v2: str, k3: str, v3: str) -> str {
+    return "{" + json_string(k1, v1) + "," + json_string(k2, v2) + "," + json_string(k3, v3) + "}";
+}
+
+// ---------------------------------------------------------------------------
+// Extract a string value from a JSON object by key (basic parser)
+// Only handles flat JSON with string values
+// ---------------------------------------------------------------------------
+
+fn json_get_value(json: str, key: str) -> str {
+    let search: str = "\"" + key + "\"";
+    let pos: i32 = str_find(json, search);
+    if (pos < 0) { return ""; }
+
+    // Find the colon after the key
+    let after_key: i32 = pos + len(search);
+    let rest: str = substr(json, after_key);
+    let colon: i32 = str_find(rest, ":");
+    if (colon < 0) { return ""; }
+
+    // Find the opening quote of the value
+    let val_rest: str = substr(rest, colon + 1);
+    let quote_start: i32 = str_find(val_rest, "\"");
+    if (quote_start < 0) { return ""; }
+
+    // Find the closing quote (handle escaped quotes)
+    let val_content: str = substr(val_rest, quote_start + 1);
+    let result: str = "";
+    let i: i32 = 0;
+    let vclen: i32 = len(val_content);
+    while (i < vclen) {
+        if (val_content[i] == '\\' && i + 1 < vclen) {
+            if (val_content[i + 1] == '"') {
+                result = result + "\"";
+                i = i + 2;
+            } else if (val_content[i + 1] == 'n') {
+                result = result + "\n";
+                i = i + 2;
+            } else if (val_content[i + 1] == 'r') {
+                result = result + "\r";
+                i = i + 2;
+            } else if (val_content[i + 1] == 't') {
+                result = result + "\t";
+                i = i + 2;
+            } else if (val_content[i + 1] == '\\') {
+                result = result + "\\";
+                i = i + 2;
+            } else {
+                result = result + val_content[i];
+                i = i + 1;
+            }
+        } else if (val_content[i] == '"') {
+            break;
+        } else {
+            result = result + val_content[i];
+            i = i + 1;
+        }
+    }
+    return result;
+}
