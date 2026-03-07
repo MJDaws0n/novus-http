@@ -72,11 +72,7 @@ fn http_read_body_small(client_fd: i32, content_length: i32) -> str {
         syscall();
         let nr: i32 = u64_to_i32(getreg(x0));
         if (nr <= 0) { break; }
-        let k: i32 = 0;
-        while (k < nr) {
-            body = body + buf[k];
-            k = k + 1;
-        }
+        body = body + copy_bytes_raw(ptr(buf), nr);
         total = total + nr;
     }
     return body;
@@ -126,11 +122,7 @@ fn http_read_request(client_fd: i32) -> str {
             syscall();
             let nr: i32 = u64_to_i32(getreg(x0));
             if (nr <= 0) { break; }
-            let k: i32 = 0;
-            while (k < nr) {
-                body = body + buf[k];
-                k = k + 1;
-            }
+            body = body + copy_bytes_raw(ptr(buf), nr);
             total = total + nr;
         }
     }
@@ -302,20 +294,20 @@ fn http_url_decode(s: str) -> str {
     let result: str = "";
     let i: i32 = 0;
     let slen: i32 = len(s);
+    let sp: u64 = ptr(s);
     while (i < slen) {
-        if (s[i] == '+') {
+        let ch: i32 = read_byte(sp + i32_to_u64(i));
+        if (ch == 43) {
             result = result + " ";
             i = i + 1;
-        } else if (s[i] == '%' && i + 2 < slen) {
-            let hi: i32 = hex_digit_val(s[i + 1] & 255);
-            let lo: i32 = hex_digit_val(s[i + 2] & 255);
+        } else if (ch == 37 && i + 2 < slen) {
+            let hi: i32 = hex_digit_val(read_byte(sp + i32_to_u64(i + 1)));
+            let lo: i32 = hex_digit_val(read_byte(sp + i32_to_u64(i + 2)));
             let val: i32 = hi * 16 + lo;
-            let tmp: str = " ";
-            tmp[0] = val;
-            result = result + tmp;
+            result = result + _byte_to_char(val);
             i = i + 3;
         } else {
-            result = result + s[i];
+            result = result + _byte_to_char(ch);
             i = i + 1;
         }
     }
@@ -346,11 +338,12 @@ fn json_escape(s: str) -> str {
     let result: str = "";
     let i: i32 = 0;
     let slen: i32 = len(s);
+    let sp: u64 = ptr(s);
     while (i < slen) {
-        let c: i32 = s[i] & 255;
-        if (s[i] == '\\') {
+        let c: i32 = read_byte(sp + i32_to_u64(i));
+        if (c == 92) {
             result = result + "\\\\";
-        } else if (s[i] == '"') {
+        } else if (c == 34) {
             result = result + "\\\"";
         } else if (c == 10) {
             result = result + "\\n";
@@ -359,7 +352,7 @@ fn json_escape(s: str) -> str {
         } else if (c == 9) {
             result = result + "\\t";
         } else {
-            result = result + s[i];
+            result = result + _byte_to_char(c);
         }
         i = i + 1;
     }
@@ -404,31 +397,34 @@ fn json_get_value(json: str, key: str) -> str {
     let result: str = "";
     let i: i32 = 0;
     let vclen: i32 = len(val_content);
+    let vcp: u64 = ptr(val_content);
     while (i < vclen) {
-        if (val_content[i] == '\\' && i + 1 < vclen) {
-            if (val_content[i + 1] == '"') {
+        let ch: i32 = read_byte(vcp + i32_to_u64(i));
+        if (ch == 92 && i + 1 < vclen) {
+            let ch2: i32 = read_byte(vcp + i32_to_u64(i + 1));
+            if (ch2 == 34) {
                 result = result + "\"";
                 i = i + 2;
-            } else if (val_content[i + 1] == 'n') {
+            } else if (ch2 == 110) {
                 result = result + "\n";
                 i = i + 2;
-            } else if (val_content[i + 1] == 'r') {
+            } else if (ch2 == 114) {
                 result = result + "\r";
                 i = i + 2;
-            } else if (val_content[i + 1] == 't') {
+            } else if (ch2 == 116) {
                 result = result + "\t";
                 i = i + 2;
-            } else if (val_content[i + 1] == '\\') {
+            } else if (ch2 == 92) {
                 result = result + "\\";
                 i = i + 2;
             } else {
-                result = result + val_content[i];
+                result = result + _byte_to_char(ch);
                 i = i + 1;
             }
-        } else if (val_content[i] == '"') {
+        } else if (ch == 34) {
             break;
         } else {
-            result = result + val_content[i];
+            result = result + _byte_to_char(ch);
             i = i + 1;
         }
     }
