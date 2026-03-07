@@ -74,11 +74,7 @@ fn http_read_body_small(client_fd: i32, content_length: i32) -> str {
         syscall();
         let nr: i32 = u64_to_i32(getreg(x0));
         if (nr <= 0) { break; }
-        let k: i32 = 0;
-        while (k < nr) {
-            body = body + buf[k];
-            k = k + 1;
-        }
+        body = body + copy_bytes_raw(ptr(buf), nr);
         total = total + nr;
     }
     return body;
@@ -132,11 +128,7 @@ fn http_read_request(client_fd: i32) -> str {
             syscall();
             let nr: i32 = u64_to_i32(getreg(x0));
             if (nr <= 0) { break; }
-            let k: i32 = 0;
-            while (k < nr) {
-                body = body + buf[k];
-                k = k + 1;
-            }
+            body = body + copy_bytes_raw(ptr(buf), nr);
             total = total + nr;
         }
     }
