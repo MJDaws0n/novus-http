@@ -1,13 +1,9 @@
-// ---------------------------------------------------------------------------
-// http - HTTP server library for Novus
-// Platform loader
-// ---------------------------------------------------------------------------
-
+// Auto-generated platform dispatcher.
 module http_main;
 
 #if(os == "darwin") {
-    import darwin_arm64;
+    import platforms/darwin/arm64;
 }
 #if(os == "linux") {
-    import linux;
+    import platforms/linux/common;
 }
