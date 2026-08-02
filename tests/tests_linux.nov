@@ -1,0 +1,66 @@
+module http_tests_linux;
+
+import ../main;
+
+fn test_pass(name: str) -> void {
+    print_raw("  [PASS] " + name + "\n");
+}
+
+fn test_fail(name: str, detail: str) -> void {
+    print_raw("  [FAIL] " + name + ": " + detail + "\n");
+}
+
+fn assert_true(name: str, value: bool) -> i32 {
+    if (value) {
+        test_pass(name);
+        return 0;
+    }
+    test_fail(name, "expected true");
+    return 1;
+}
+
+fn assert_eq_str(name: str, got: str, expected: str) -> i32 {
+    if (str_equals(got, expected)) {
+        test_pass(name);
+        return 0;
+    }
+    test_fail(name, "got '" + got + "', expected '" + expected + "'");
+    return 1;
+}
+
+fn main() -> i32 {
+    let failures: i32 = 0;
+    print_raw("=== http Linux dependency tests ===\n");
+
+    failures = failures + assert_eq_str(
+        "request path",
+        http_get_path("GET /index.html HTTP/1.1\n\n"),
+        "/index.html"
+    );
+    failures = failures + assert_eq_str(
+        "content type",
+        http_content_type("index.html"),
+        "text/html; charset=utf-8"
+    );
+
+    // These functions come from file_io through http's public loader. This is
+    // the dependency edge missing from releases through 1.0.4.
+    failures = failures + assert_true("VERSION exists", file_exists("VERSION"));
+    failures = failures + assert_true(
+        "VERSION readable",
+        str_contains(read_file("VERSION"), "1.0.5")
+    );
+
+    // A negative fd makes sends harmless while still exercising both static
+    // file branches and proving file_exists/read_file are linked.
+    http_serve_file(-1, "VERSION");
+    http_serve_file(-1, "this-file-does-not-exist");
+    test_pass("http_serve_file linked and executed");
+
+    if (failures > 0) {
+        print_raw(i32_to_str(failures) + " test(s) FAILED\n");
+        return 1;
+    }
+    print_raw("All tests PASSED\n");
+    return 0;
+}

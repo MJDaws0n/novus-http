@@ -17,6 +17,16 @@ nox pull http
 import lib/http http;
 ```
 
+The package imports its `std`, `net`, and `file_io` dependencies through the
+public loader. Callers do not need separate imports for HTTP's internal use of
+networking or static-file helpers.
+
+## Supported targets
+
+- macOS arm64
+- Linux x86-64
+- Linux arm64
+
 ## Functions
 
 ### `hex_digit_val`
