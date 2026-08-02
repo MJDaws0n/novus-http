@@ -1,6 +1,13 @@
 // Auto-generated platform dispatcher.
 module http_main;
 
+// HTTP uses helpers from all three packages in its platform implementations.
+// Import them here so consumers only need to import lib/http; merely listing a
+// package in libraries.conf installs it but does not link its functions.
+import ../std;
+import ../net;
+import ../file_io;
+
 #if(os == "darwin") {
     import platforms/darwin/arm64;
 }

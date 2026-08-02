@@ -20,3 +20,13 @@ See [`docs.md`](docs.md) for the full API reference.
 ```novus
 import lib/http http;
 ```
+
+`http` installs and imports its `std`, `net`, and `file_io` dependencies. An
+application only needs to import `lib/http` to use the complete API, including
+`http_serve_file`.
+
+## Supported targets
+
+- macOS arm64
+- Linux x86-64
+- Linux arm64
